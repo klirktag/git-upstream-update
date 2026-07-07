@@ -9,6 +9,10 @@ an `upstream` remote, fetch it, check out the default branch, fast-forward it,
 and push it back to your fork. This script does all of that for you, and figures
 out the upstream automatically by asking GitHub.
 
+If the current repo **isn't** a fork, the script still helps: it just
+fast-forwards the default branch from `origin` and stops. Either way, it leaves
+you back on whatever branch you were on when you started.
+
 ## Example
 
 Run it from inside a clone of your fork:
@@ -37,8 +41,8 @@ Running `git-upstream-update.sh` inside a clone of your fork performs these
 steps:
 
 1. **Detect the fork.** It calls `gh repo view` to ask GitHub about the current
-   repository. If GitHub doesn't consider it a fork, the script stops — there's
-   no upstream to sync from.
+   repository. If GitHub doesn't consider it a fork, it switches to the non-fork
+   path (see [below](#when-the-repo-isnt-a-fork)).
 2. **Find the upstream.** GitHub reports the `parent` repository a fork was
    created from (the same "forked from …" you see in the GitHub UI). That parent
    is treated as the upstream.
@@ -54,6 +58,27 @@ steps:
    local branch a clean mirror of upstream. If your working tree has uncommitted
    changes, it refuses to run so nothing is clobbered.
 6. **Push to your fork.** It pushes the freshly-updated branch to `origin`.
+7. **Return to where you started.** If checking out the default branch moved you
+   off your working branch, the script switches back to it before exiting — even
+   if an error or the divergence warning cut the run short.
+
+### When the repo isn't a fork
+
+If GitHub reports the repository is not a fork, there's no upstream to sync from,
+so the script does the simpler thing: it fetches `origin`, fast-forwards the
+default branch, and stops. No `upstream` remote is added and nothing is pushed
+back (there's no separate origin to push to). You'll see:
+
+```console
+$ git-upstream-update.sh
+>> querying GitHub for repository metadata...
+>> this repository is not a fork; updating its default branch from origin.
+>> default branch         : main
+>> fetching from 'origin'...
+>> checking out 'main'...
+>> fast-forwarding 'main' to 'origin/main'...
+>> done. 'main' is now up to date with origin.
+```
 
 ### Pushing is safe by default
 
