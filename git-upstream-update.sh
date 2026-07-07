@@ -13,6 +13,9 @@
 #   5. Fetches upstream and fast-forwards the local default branch to it.
 #   6. Pushes the updated branch to `origin` (never force-pushed).
 #
+# If the repo is NOT a fork, the script just fast-forwards the current repo's
+# default branch from `origin` and stops (no upstream remote, no push back).
+#
 # Requirements: git, gh (authenticated: `gh auth status`).
 #
 # After updating, the default branch is pushed to `origin` (never force-pushed).
@@ -41,6 +44,20 @@ info() {
     echo ">> $*" >&2
 }
 
+# Restore whatever ref the user was on when the script started. Registered as an
+# EXIT trap so we return there on success, error, or early exit alike.
+orig_ref=""
+restore_branch() {
+    [[ -n "$orig_ref" ]] || return 0
+    local now
+    now=$(git symbolic-ref --quiet --short HEAD 2>/dev/null \
+        || git rev-parse HEAD 2>/dev/null || echo)
+    if [[ -n "$now" && "$now" != "$orig_ref" ]]; then
+        info "returning to '$orig_ref'..."
+        git checkout --quiet "$orig_ref" || true
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -f|--force)
@@ -53,7 +70,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -h|--help)
-            sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '3,31p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -70,6 +87,12 @@ command -v jq  >/dev/null 2>&1 || die "jq is not installed"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "not inside a git repository"
 
+# Remember where we started (branch name, or commit SHA if detached) so we can
+# return here when we're done, even though we check out the default branch.
+orig_ref=$(git symbolic-ref --quiet --short HEAD 2>/dev/null \
+    || git rev-parse HEAD 2>/dev/null || echo)
+trap restore_branch EXIT
+
 # Query GitHub for fork status, parent, and the parent's default branch.
 # `gh repo view` operates on the repo of the current directory.
 info "querying GitHub for repository metadata..."
@@ -78,38 +101,59 @@ repo_json=$(gh repo view \
     || die "could not read repo metadata from gh (is the remote a GitHub repo, and are you authenticated? try 'gh auth status')"
 
 is_fork=$(printf '%s' "$repo_json" | jq -r '.isFork')
-[[ "$is_fork" == "true" ]] \
-    || die "this repository is not a fork; there is no upstream to sync from"
 
-# The parent object exposes `owner.login` and `name` (there is no
-# `nameWithOwner` field on it), so build the "owner/repo" slug ourselves.
-parent_slug=$(printf '%s' "$repo_json" \
-    | jq -r 'if .parent and .parent.owner.login and .parent.name
-             then "\(.parent.owner.login)/\(.parent.name)" else empty end')
-[[ -n "$parent_slug" ]] \
-    || die "repo is marked as a fork but no parent was returned by gh"
+# The repo's own default branch, used for the non-fork case and as a fallback.
+own_default_branch=$(printf '%s' "$repo_json" \
+    | jq -r '.defaultBranchRef.name // empty')
 
-# Prefer the parent's default branch; fall back to our own if absent.
-default_branch=$(printf '%s' "$repo_json" \
-    | jq -r '.parent.defaultBranchRef.name // .defaultBranchRef.name // empty')
-[[ -n "$default_branch" ]] \
-    || die "could not determine the default branch"
+# These are decided per case: which remote we sync the default branch from, the
+# branch name, a human label for the source, and whether we push back to origin.
+if [[ "$is_fork" == "true" ]]; then
+    # The parent object exposes `owner.login` and `name` (there is no
+    # `nameWithOwner` field on it), so build the "owner/repo" slug ourselves.
+    parent_slug=$(printf '%s' "$repo_json" \
+        | jq -r 'if .parent and .parent.owner.login and .parent.name
+                 then "\(.parent.owner.login)/\(.parent.name)" else empty end')
+    [[ -n "$parent_slug" ]] \
+        || die "repo is marked as a fork but no parent was returned by gh"
 
-info "upstream (parent) repo : $parent_slug"
-info "default branch         : $default_branch"
+    # Prefer the parent's default branch; fall back to our own if absent.
+    default_branch=$(printf '%s' "$repo_json" \
+        | jq -r '.parent.defaultBranchRef.name // empty')
+    [[ -n "$default_branch" ]] || default_branch="$own_default_branch"
+    [[ -n "$default_branch" ]] || die "could not determine the default branch"
 
-# Ensure the upstream remote exists and points at the parent.
-upstream_url="https://github.com/${parent_slug}.git"
-if git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1; then
-    current_url=$(git remote get-url "$UPSTREAM_REMOTE")
-    info "remote '$UPSTREAM_REMOTE' already exists ($current_url)"
+    info "upstream (parent) repo : $parent_slug"
+    info "default branch         : $default_branch"
+
+    # Ensure the upstream remote exists and points at the parent.
+    upstream_url="https://github.com/${parent_slug}.git"
+    if git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1; then
+        current_url=$(git remote get-url "$UPSTREAM_REMOTE")
+        info "remote '$UPSTREAM_REMOTE' already exists ($current_url)"
+    else
+        info "adding remote '$UPSTREAM_REMOTE' -> $upstream_url"
+        git remote add "$UPSTREAM_REMOTE" "$upstream_url"
+    fi
+
+    sync_remote="$UPSTREAM_REMOTE"
+    source_label="$parent_slug"
+    push_to_origin=1
 else
-    info "adding remote '$UPSTREAM_REMOTE' -> $upstream_url"
-    git remote add "$UPSTREAM_REMOTE" "$upstream_url"
+    # Not a fork: just refresh the current repo's default branch from origin.
+    info "this repository is not a fork; updating its default branch from origin."
+    default_branch="$own_default_branch"
+    [[ -n "$default_branch" ]] || die "could not determine the default branch"
+
+    info "default branch         : $default_branch"
+
+    sync_remote="origin"
+    source_label="origin"
+    push_to_origin=0
 fi
 
-info "fetching from '$UPSTREAM_REMOTE'..."
-git fetch "$UPSTREAM_REMOTE" "$default_branch"
+info "fetching from '$sync_remote'..."
+git fetch "$sync_remote" "$default_branch"
 
 # Refuse to clobber uncommitted work.
 if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -119,11 +163,15 @@ fi
 info "checking out '$default_branch'..."
 git checkout "$default_branch"
 
-# Fast-forward only: this keeps the local branch a clean mirror of upstream.
-info "fast-forwarding '$default_branch' to '${UPSTREAM_REMOTE}/${default_branch}'..."
-git merge --ff-only "${UPSTREAM_REMOTE}/${default_branch}"
+# Fast-forward only: this keeps the local branch a clean mirror of the source.
+info "fast-forwarding '$default_branch' to '${sync_remote}/${default_branch}'..."
+git merge --ff-only "${sync_remote}/${default_branch}"
 
-info "done. '$default_branch' is now up to date with $parent_slug."
+info "done. '$default_branch' is now up to date with $source_label."
+
+# Nothing more to do when the repo isn't a fork — the default branch is updated
+# and there is no separate origin to push back to.
+[[ "$push_to_origin" -eq 1 ]] || exit 0
 
 # Push to origin. By default this is never forced: a non-fast-forward rejection
 # means origin has diverged from upstream, and we stop with a warning rather
